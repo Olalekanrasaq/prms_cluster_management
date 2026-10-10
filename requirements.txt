@@ -1,0 +1,5 @@
+st-gsheets-connection
+streamlit-cookies-manager
+streamlit
+gspread
+google-auth
