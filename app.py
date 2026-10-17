@@ -168,6 +168,26 @@ def clusters_in(groups, sheet) -> list[str]:
     return sorted({g for g in df["group"] if g}, key=str.upper)
 
 
+def delete_row_numbers(sheet: str, row_numbers: list[int]):
+    """Delete sheet rows (1-based) in ONE write request, whatever the count.
+    Contiguous rows are grouped; ranges go bottom-up so indexes stay valid."""
+    ranges = []
+    for n in sorted(set(row_numbers), reverse=True):
+        if ranges and ranges[-1][0] == n + 1:
+            ranges[-1][0] = n          # extend current block upwards
+        else:
+            ranges.append([n, n])      # [first, last]
+    ws = worksheet_map()[sheet]
+    body = {"requests": [
+        {"deleteDimension": {"range": {
+            "sheetId": ws.id, "dimension": "ROWS",
+            "startIndex": first - 1, "endIndex": last,
+        }}}
+        for first, last in ranges
+    ]}
+    with_retry(get_spreadsheet().batch_update, body)
+
+
 def append_rows(sheet: str, rows: list[list[str]]):
     """Add rows below the existing data (1 write request)."""
     with_retry(
@@ -183,7 +203,7 @@ def append_rows(sheet: str, rows: list[list[str]]):
 # user clicks Review. Input widgets are hidden during review, and Edit/Cancel
 # writes the snapshot back into the widget keys so nothing the user typed is lost.
 # ---------------------------------------------------------------------------
-for p in ("t1", "t2", "t3"):
+for p in ("t1", "t2", "t3", "t4"):
     ss.setdefault(f"{p}_stage", "edit")
     ss.setdefault(f"{p}_errors", [])
     ss.setdefault(f"{p}_success", "")
@@ -356,6 +376,90 @@ def t3_remove():
 
 
 # ---------------------------------------------------------------------------
+# Tab 4: rename or delete a whole cluster
+# ---------------------------------------------------------------------------
+def cluster_rows(rows: list[list[str]], cluster: str) -> list[int]:
+    """1-based sheet row numbers whose group matches cluster (header skipped)."""
+    return [
+        i for i, r in enumerate(rows[1:], start=2)
+        if len(r) >= 2 and clean(r[0]) and norm(r[1]) == norm(cluster)
+    ]
+
+
+def t4_validate(groups, state, cluster, action, new_name) -> list[str]:
+    errs = []
+    if not cluster:
+        errs.append("Choose a cluster.")
+    if action == "Rename" and cluster:
+        if not new_name:
+            errs.append("Enter the new cluster name.")
+        elif new_name == cluster:
+            errs.append("The new name is the same as the current name.")
+        elif norm(new_name) != norm(cluster) and norm(new_name) in {
+            norm(c) for c in clusters_in(groups, state)
+        }:
+            errs.append(
+                f"Cluster **{new_name}** already exists in {label(state)}. "
+                "Choose a different name."
+            )
+    return errs
+
+
+def t4_review():
+    pending = {
+        "state": ss.t4_state,
+        "cluster": ss.get("t4_cluster"),
+        "action": ss.t4_action,
+        "new_name": clean(ss.get("t4_new_name", "")),
+    }
+    ss.t4_pending = pending
+    errs = t4_validate(load_groups(), **pending)
+    ss.t4_errors = errs
+    ss.t4_stage = "edit" if errs else "review"
+
+
+def t4_submit():
+    pending = ss.t4_pending
+    sheet, cluster, action, new_name = (
+        pending["state"], pending["cluster"], pending["action"], pending["new_name"]
+    )
+    try:
+        refresh()  # validate against live data before writing
+        errs = t4_validate(load_groups(), **pending)
+        if errs:
+            back_to_edit("t4", errs)
+            return
+        rows = live_rows(sheet)  # fresh read so row numbers are current
+        targets = cluster_rows(rows, cluster)
+        if not targets:
+            back_to_edit("t4", [f"Cluster **{cluster}** was not found. It may already have been changed."])
+            ss.t4_cluster = None
+            return
+        if action == "Rename":
+            updates = [{"range": f"B{i}", "values": [[new_name]]} for i in targets]
+            with_retry(worksheet_map()[sheet].batch_update, updates, value_input_option="RAW")
+        else:
+            delete_row_numbers(sheet, targets)
+    except Exception as e:  # noqa: BLE001
+        back_to_edit("t4", [f"{action} failed: {e}"])
+        return
+    refresh()
+    if action == "Rename":
+        ss.t4_success = (
+            f"Renamed **{cluster}** to **{new_name}** in {label(sheet)} "
+            f"({len(targets)} PRM(s) updated)."
+        )
+    else:
+        ss.t4_success = (
+            f"Deleted cluster **{cluster}** from {label(sheet)} "
+            f"({len(targets)} PRM(s) removed)."
+        )
+    ss.t4_state, ss.t4_action = sheet, action
+    ss.t4_cluster, ss.t4_new_name = None, ""
+    ss.t4_pending, ss.t4_stage, ss.t4_errors = None, "edit", []
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 st.title("PRM Cluster Management")
@@ -378,7 +482,9 @@ with st.sidebar:
         refresh_all()
         st.rerun()
 
-tab1, tab2, tab3 = st.tabs(["New cluster", "Add PRM to cluster", "Remove PRM from cluster"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["New cluster", "Add PRM to cluster", "Remove PRM from cluster", "Manage cluster"]
+)
 
 # ---- Tab 1 ----------------------------------------------------------------
 with tab1:
@@ -499,3 +605,57 @@ with tab3:
         c1, c2, _ = st.columns([1, 1, 4])
         c1.button("Yes, remove", key="t3_go", on_click=t3_remove, type="primary")
         c2.button("Cancel", key="t3_cancel", on_click=back_to_edit, args=("t3",))
+
+# ---- Tab 4 ----------------------------------------------------------------
+with tab4:
+    st.subheader("Rename or delete a cluster")
+    if ss.t4_stage == "edit":
+        state4 = st.selectbox(
+            "State", states, key="t4_state", format_func=label,
+            on_change=on_state_change, args=("t4_cluster",),
+        )
+        cluster4 = st.selectbox(
+            "Cluster",
+            clusters_in(groups, state4),
+            key="t4_cluster",
+            index=None,
+            placeholder="Choose a cluster",
+        )
+        members4 = []
+        if cluster4:
+            df = groups[state4]
+            members4 = sorted(df.loc[df["group"].map(norm) == norm(cluster4), "prm_name"])
+            st.caption(f"{len(members4)} PRM(s) in this cluster")
+        action4 = st.radio(
+            "Action", ["Rename", "Delete"], key="t4_action", horizontal=True,
+        )
+        if action4 == "Rename":
+            st.text_input("New cluster name", key="t4_new_name", disabled=not cluster4)
+        show_messages("t4")
+        st.button(
+            "Review", key="t4_review_btn", on_click=t4_review, type="primary",
+            disabled=not cluster4,
+        )
+    else:
+        pend = ss.t4_pending
+        df = groups.get(pend["state"], pd.DataFrame(columns=["prm_name", "group"]))
+        members4 = sorted(df.loc[df["group"].map(norm) == norm(pend["cluster"]), "prm_name"])
+        if pend["action"] == "Rename":
+            st.info(
+                f"Please confirm: rename **{pend['cluster']}** to **{pend['new_name']}** "
+                f"in **{label(pend['state'])}**. These {len(members4)} PRM(s) move with it."
+            )
+            confirm_label = "Confirm rename"
+        else:
+            st.warning(
+                f"Delete cluster **{pend['cluster']}** from **{label(pend['state'])}**? "
+                f"All {len(members4)} PRM(s) below will be removed from the sheet. "
+                "This cannot be undone from the app."
+            )
+            confirm_label = "Yes, delete cluster"
+        st.dataframe(
+            pd.DataFrame({"prm_name": members4}), hide_index=True, width="stretch",
+        )
+        c1, c2, _ = st.columns([1, 1, 4])
+        c1.button(confirm_label, key="t4_go", on_click=t4_submit, type="primary")
+        c2.button("Cancel", key="t4_cancel", on_click=back_to_edit, args=("t4",))
